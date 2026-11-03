@@ -93,7 +93,7 @@ are siblings.
    before installing.
 5. Install with the documented CLI:
    `npx -p @enconvo/api enconvo plugin marketplace add <marketplace abs path>`,
-   then `npx -p @enconvo/api enconvo plugin install <name>-enconvo@<name>-enconvo>`.
+   then `npx -p @enconvo/api enconvo plugin install <name>-enconvo@<name>-enconvo`.
    Environment note (this Mac only): the `npx -p @enconvo/api` route has
    stalled here; the same commands work through the local CLI at
    `~/.config/enconvo/bin/enconvo`. Use the documented form first and fall
