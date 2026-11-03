@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUILDER = "/Users/bradhallett/Documents/Agent Plugins/.enconvo/skills/repo-to-plugin/scripts/new_plugin.py"
+BUILDER = str(Path(__file__).resolve().parent / "new_plugin.py")
 ROOT = Path("/tmp/r2p-verify")
 FAILS = []
 
@@ -409,8 +409,16 @@ r2 = sh("python3", BUILDER, "build", "--config", str(ROOT / "t15-enconvo/build-c
 case("agents: rebuild is stable (no double scoping)", r2.returncode == 0 and (proot / "skills/audit/SKILL.md").read_text().count("visibility") == 1)
 
 # --- 19. validator accepts the agents manifest ---
+# Runs when the local CLI both exists and starts: an installed plugin whose
+# command name collides with the CLI's own (e.g. a `balance` command) makes
+# the CLI crash at startup, which says nothing about the manifest.
 cli = os.path.expanduser("~/.config/enconvo/bin/enconvo")
 if os.path.exists(cli):
+    boot = sh(cli, "plugin", "validate", "--help")
+    cli_ok = boot.returncode == 0
+else:
+    cli_ok = False
+if cli_ok:
     v = sh(cli, "plugin", "validate", "--json", str(proot))
     txt = v.stdout + v.stderr
     bad = [c for c in ("plugin_agents_path_not_file", "plugin_component_frontmatter_missing", "plugin_component_description_missing", "default_agents_folder_ignored") if c in txt]

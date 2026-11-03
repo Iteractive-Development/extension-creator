@@ -1318,11 +1318,16 @@ def cmd_build(args):
 
 
 def enconvo_cli():
+    # Documented route first (Installing Plugins: `npx -p @enconvo/api
+    # enconvo ...`, or bare `enconvo` inside a project that depends on
+    # @enconvo/api); ~/.config/enconvo/bin/enconvo is an environment-specific
+    # fallback for Macs where the npx route stalls.
     for cand in (os.environ.get("ENCONVO_CLI"), shutil.which("enconvo"),
                  str(Path("~/.config/enconvo/bin/enconvo").expanduser())):
         if cand and Path(cand).is_file():
             return cand
-    sys.exit("enconvo CLI not found (set ENCONVO_CLI or add it to PATH)")
+    sys.exit("enconvo CLI not found (set ENCONVO_CLI, run through the "
+             "documented `npx -p @enconvo/api enconvo` route, or add it to PATH)")
 
 
 def cmd_agents(args):

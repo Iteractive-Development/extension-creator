@@ -1,6 +1,8 @@
 ---
 name: repo-to-plugin
 description: Package a repo of agent skills (Claude Code plugin with skills and agents, or a skills repo) into an updatable Enconvo folder marketplace carrying one plugin (series convention <name>-enconvo), with one Enconvo Agent per skill group that sees only its own skills. Use when Brad gives a repo as "Plugin N" of his plugin series, asks to turn a repo into an Enconvo plugin or Agents, or asks to sync or update an already-packaged one.
+metadata:
+  short-description: Turn skills repos into native Enconvo plugins
 ---
 
 # Repo to Enconvo plugin
@@ -89,10 +91,13 @@ are siblings.
    `references/` subfolders (the validator reads them as groups); they are
    warnings, not blockers, and they appear in both layouts. Fix any error
    before installing.
-5. Install: `enconvo plugin marketplace add <marketplace abs path>`, then
-   `enconvo plugin install <name>-enconvo@<name>-enconvo`. The CLI is
-   `~/.config/enconvo/bin/enconvo`; the documented `npx -p @enconvo/api`
-   route stalls on this Mac.
+5. Install with the documented CLI:
+   `npx -p @enconvo/api enconvo plugin marketplace add <marketplace abs path>`,
+   then `npx -p @enconvo/api enconvo plugin install <name>-enconvo@<name>-enconvo>`.
+   Environment note (this Mac only): the `npx -p @enconvo/api` route has
+   stalled here; the same commands work through the local CLI at
+   `~/.config/enconvo/bin/enconvo`. Use the documented form first and fall
+   back to the local bin only when it hangs.
 6. Verify: `enconvo plugin marketplace list` shows the plugin `(installed)`,
    and `~/.config/enconvo/extension/<plugin>` holds its skill folders.
    Count SKILL.md against the upstream repo. `plugins/capabilities/search`

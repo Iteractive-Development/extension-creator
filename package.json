@@ -4,20 +4,15 @@
   "version": "1.0.0",
   "title": "Extension Creator",
   "description": "Package a repo of agent skills (Claude Code plugin with skills and agents, or a skills repo) into an updatable Enconvo folder marketplace carrying one native Enconvo plugin with one Agent per skill group.",
-  "short_description": "Turn skills/agent repos into native Enconvo extensions",
+  "interface": {
+    "shortDescription": "Turn skills/agent repos into native Enconvo extensions"
+  },
   "author": "Iteractive Development",
   "homepage": "https://iteractive.dev",
-  "icon": "assets/marketing-icon.png",
+  "icon": "marketing-icon.png",
   "license": "MIT",
   "categories": [
     "Developer Tools"
   ],
-  "commands": [],
-  "skills": [
-    {
-      "name": "repo-to-plugin",
-      "description": "Package a repo of agent skills into an updatable Enconvo folder marketplace carrying one plugin (series convention <name>-enconvo), with one Enconvo Agent per skill group.",
-      "skillPath": "skills/repo-to-plugin"
-    }
-  ]
+  "commands": []
 }
