@@ -152,8 +152,16 @@ def collect_agents(repo, manifest):
     if isinstance(listed, str):
         listed = [listed]
     if isinstance(listed, list) and listed:
+        repo_root = repo.resolve()
         for e in listed:
             p = (repo / str(e)).resolve()
+            # F5: hostile manifest agents[] entry - refuse anything that
+            # resolves outside the repo before calling relative_to (which
+            # would crash with a raw traceback, half-building the adapter).
+            if p != repo_root and repo_root not in p.parents:
+                sys.exit(
+                    f"{repo.name}: manifest agents entry leaves the repo: {e}"
+                )
             if p.is_dir():
                 rels += sorted(q.relative_to(repo.resolve()) for q in p.rglob("*.md"))
             elif p.is_file():

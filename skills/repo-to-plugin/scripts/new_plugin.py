@@ -92,22 +92,20 @@ def synth_manifest(repo):
             )
             break
     license = "Unknown"
-    for lic_name in ("LICENSE", "LICENSE.txt", "LICENCE", "COPYING"):
-        p = repo / lic_name
-        if p.is_file():
-            head = p.read_text(errors="replace")[:400].lower()
-            for marker, spdx in (
-                ("apache license", "Apache-2.0"),
-                ("gnu lesser general public license", "LGPL-3.0"),
-                ("gnu general public license", "GPL-3.0"),
-                ("mozilla public license", "MPL-2.0"),
-                ("permission is hereby granted, free of charge", "MIT"),
-                ("bsd", "BSD-3-Clause"),
-            ):
-                if marker in head:
-                    license = spdx
-                    break
-            break
+    lic_file = find_license(repo)
+    if lic_file is not None:
+        head = lic_file.read_text(errors="replace")[:400].lower()
+        for marker, spdx in (
+            ("apache license", "Apache-2.0"),
+            ("gnu lesser general public license", "LGPL-3.0"),
+            ("gnu general public license", "GPL-3.0"),
+            ("mozilla public license", "MPL-2.0"),
+            ("permission is hereby granted, free of charge", "MIT"),
+            ("bsd", "BSD-3-Clause"),
+        ):
+            if marker in head:
+                license = spdx
+                break
     version = run(["git", "describe", "--tags", "--abbrev=0"], cwd=repo, check=False) or "1.0.0"
     manifest = {"name": repo.name, "version": version, "description": desc, "license": license}
     remote = run(["git", "-C", str(repo), "remote", "get-url", "origin"], check=False)
@@ -240,16 +238,45 @@ def discover_skills(repo):
     return usable, left_out
 
 
+def validate_skill_entry(repo, entry):
+    """F1: a manifest-listed skills entry must name a skills/... path inside
+    the upstream repo. A hostile manifest ("../victim/skills/loot", "/etc",
+    "skills/../../vault") must fail the build here, before anything is
+    copied, instead of shipping files from outside the repo."""
+    raw = str(entry)
+    p = Path(raw)
+    if p.is_absolute() or raw.startswith("~"):
+        sys.exit(
+            f"{repo.name}: manifest skills entry must be a repo-relative "
+            f"path, got: {raw}"
+        )
+    parts = tuple(part for part in p.parts if part != ".")
+    if not parts or parts[0] != "skills":
+        sys.exit(
+            f"{repo.name}: manifest skills entry must live under skills/: {raw}"
+        )
+    skills_root = (repo / "skills").resolve()
+    resolved = (repo / Path(*parts)).resolve()
+    if resolved != skills_root and skills_root not in resolved.parents:
+        sys.exit(
+            f"{repo.name}: manifest skills entry leaves the repo's skills/ "
+            f"tree: {raw}"
+        )
+
+
 def collect_skills(repo, manifest):
     """Returns (entries, left_out). entries drive the plugins. left_out names
     skill folders on disk that will not ship - 'template' dirs, or folders the
     upstream manifest's skills list does not name - so nothing drops
-    silently on a sync."""
+    silently on a sync. Manifest-listed entries are validated (F1) so a
+    hostile upstream cannot reach outside its own repo."""
     usable, template_out = discover_skills(repo)
     by_name = {Path(f).parent.name: f for f in usable}
     entries = manifest.get("skills")
     if isinstance(entries, list) and entries:
         listed = [str(e) for e in entries]
+        for e in listed:
+            validate_skill_entry(repo, e)
         listed_names = {Path(e.rstrip("/")).name for e in listed}
         return listed, sorted(set(template_out) | (set(by_name) - listed_names))
     if not usable:
@@ -260,7 +287,14 @@ def collect_skills(repo, manifest):
 
 
 def group_of(entry):
+    """F1: the group segment of a skill entry. A validated entry has already
+    been checked to stay under skills/; this still refuses anything whose
+    parts do not literally sit under a skills/ segment (e.g. after a hostile
+    entry slipped in some other way), so the copy destination is never
+    derived from a traversal path."""
     parts = Path(entry.rstrip("/")).parts
+    if any(part in ("..", ".") for part in parts):
+        sys.exit(f"unexpected skill path: {entry}")
     if len(parts) >= 3 and parts[-3] == "skills":
         return parts[-2]      # skills/<group>/<name>
     if len(parts) >= 2 and parts[-2] == "skills":
@@ -290,6 +324,20 @@ def repos_of(config):
     return []
 
 
+def resolve_config_paths(config, base):
+    """Repo paths and plugin_icon may be written relative to the
+    build-config's own folder (the committed package configs do); resolve
+    them against it so the documented build/sync command works from any
+    CWD, not only the adapter dir."""
+    for rcfg in repos_of(config):
+        p = Path(rcfg["path"])
+        if not p.is_absolute():
+            rcfg["path"] = str((base / p).resolve())
+    icon = config.get("plugin_icon")
+    if icon and not Path(icon).is_absolute():
+        config["plugin_icon"] = str((base / Path(icon)).resolve())
+
+
 def check_config(config, path):
     """Clean errors for hand-edited or stale build-configs, before any build."""
     if not isinstance(config, dict):
@@ -315,6 +363,13 @@ def check_config(config, path):
             sys.exit(f"{path}: 'agents.shared_skills' must map a skill name to a list of group ids")
         if acfg.get("enabled") and not config.get("plugin_name"):
             sys.exit(f"{path}: 'agents' needs single-plugin mode (a 'plugin_name'); rerun 'new' with --single")
+    if config.get("root_package") and not config.get("plugin_name"):
+        sys.exit(f"{path}: 'root_package' needs single-plugin mode (a 'plugin_name')")
+    carry = config.get("carry")
+    if carry is not None and not (
+        isinstance(carry, list) and all(isinstance(c, str) and c for c in carry)
+    ):
+        sys.exit(f"{path}: 'carry' must be a list of repo-relative paths")
     return config
 
 
@@ -379,6 +434,25 @@ def inside_repo(target, repo):
     except ValueError:
         return False
     return ".git" not in rel.parts
+
+
+def check_no_escape_links(repo, dirs):
+    """F6: refuse symlinks whose target resolves outside the repo before any
+    copy. shutil.copytree/copy2 follow links, so a planted `leak -> /etc/...`
+    would ship the secret's content; failing the build first is the fix."""
+    repo_root = repo.resolve()
+    for d in dirs:
+        d = (repo / str(d).rstrip("/")) if not Path(d).is_absolute() else Path(d)
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            if p.is_symlink():
+                target = p.resolve()
+                if target != repo_root and repo_root not in target.parents:
+                    sys.exit(
+                        f"symlink leaves the repo and would leak its target "
+                        f"into the package: {p} -> {target}"
+                    )
 
 
 def copy_entries(repo, entries, root):
@@ -515,6 +589,7 @@ def relink(text, rel, repo, dest):
 
 
 ROOT_VAR_RE = re.compile(r"\$\{CLAUDE_PLUGIN_ROOT\}/([^\s)\"'`\]]+)")
+ROOT_CLI_RE = re.compile(r"node tools/clis/([A-Za-z0-9._-]+\.js)")
 
 
 def remap_plugin_root(text, dest):
@@ -594,6 +669,14 @@ def find_license(repo):
         p = repo / name
         if p.is_file():
             return p
+    # Some repos keep the license one level down (e.g. a monorepo or a
+    # vendored project dir). Look in non-hidden subdirectories, sorted for
+    # deterministic picks; a root-level file always wins.
+    for sub in sorted(d for d in repo.iterdir() if d.is_dir() and not d.name.startswith(".")):
+        for name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "LICENCE", "COPYING"):
+            p = sub / name
+            if p.is_file():
+                return p
     return None
 
 
@@ -700,6 +783,7 @@ def generate(config):
             root = staging / "plugins" / name
             (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
 
+            check_no_escape_links(repo, group_entries)
             extra, skipped = copy_entries(repo, group_entries, root)
 
             icon_file = (
@@ -728,7 +812,7 @@ def generate(config):
                 "description": desc,
                 "author": manifest.get("author", owner),
                 "repository": manifest.get("repository") or repo_url,
-                "license": manifest.get("license", "MIT"),
+                "license": manifest.get("license") or "Unknown",
                 "keywords": [k for k in keywords if k],
                 "skills": group_entries,
             }
@@ -798,7 +882,7 @@ def generate(config):
         mkt_desc = (
             f"{prefix} split into per-group agent plugins. Built from "
             f"{config.get('repo_url') or manifest.get('repository', 'upstream')} "
-            f"({manifest.get('license', 'MIT')})."
+            f"({manifest.get('license') or 'Unknown'})."
         )
     marketplace = {
         "name": mkt_name,
@@ -844,10 +928,21 @@ def generate_single(config):
     its manifest; a multi-repo merge credits the series owner and copies each
     upstream's LICENSE file as LICENSE-<repo> so attribution still ships."""
     adapter = Path(config["adapter_dir"]).resolve()
+    root_pkg = bool(config.get("root_package"))
+    # F4: root_package builds the published-package layout directly — the
+    # plugin tree at the package repo's root (skills/, agents/, assets/,
+    # .claude-plugin/plugin.json, tools/, LICENSE-*), with no marketplace/,
+    # no native package.json and no scoped markers — so `build`/`sync`
+    # reproduce the committed published packages byte-for-byte instead of the
+    # old generator shape that had to be hand-flattened.
+    package_dir = adapter
+    if root_pkg and config.get("package_dir"):
+        p = Path(config["package_dir"])
+        package_dir = (p if p.is_absolute() else adapter / p).resolve()
+    staging = package_dir / ".package-new" if root_pkg else adapter / ".marketplace-new"
     mkt_dir = adapter / "marketplace"
-    staging = adapter / ".marketplace-new"
     retired = adapter / ".marketplace-old"
-    for d in (staging, retired):
+    for d in ((staging, retired) if not root_pkg else (staging,)):
         if d.exists():
             shutil.rmtree(d)
     prefix = config["prefix"]
@@ -863,7 +958,7 @@ def generate_single(config):
     repos = repos_of(config)
     multi = len(repos) > 1
 
-    root = staging / "plugins" / plugin_name
+    root = staging / "plugins" / plugin_name if not root_pkg else staging
     (root / ".claude-plugin").mkdir(parents=True)
     merged_entries, merged_names = [], []
     merged_keywords = {prefix}
@@ -877,7 +972,10 @@ def generate_single(config):
     unshipped_all = {}
     agents_cfg = config.get("agents") or {}
     agents_on = bool(agents_cfg.get("enabled"))
-    scoped = agents_on and agents_cfg.get("scoped", True) is not False
+    # F4: published packages ship no `visibility: scoped` markers (they broke
+    # loading in earlier rounds); the agent split stays as build-config
+    # groups + agents/*.md, which the README documents as the per-agent map.
+    scoped = (not root_pkg) and agents_on and agents_cfg.get("scoped", True) is not False
     shipped_agents, agent_paths = [], {}
     explicit_map, nesting_map = {}, {}
     raw_groups = config.get("groups") or {}
@@ -890,9 +988,16 @@ def generate_single(config):
         build_version = f"{version}+{sha}" if sha else version
         versions[repo.name] = build_version
         if idx == 0:
-            version_stamp = build_version
-            author = owner if multi else (manifest.get("author") or owner)
-            repository = manifest.get("repository") or repo_url
+            if root_pkg:
+                # F4: a published package versions independently of the
+                # upstream stamp (its own release series), credits the
+                # series owner and ships no repository key
+                version_stamp = config.get("plugin_version") or version
+                author = owner
+            else:
+                version_stamp = build_version
+                author = owner if multi else (manifest.get("author") or owner)
+                repository = manifest.get("repository") or repo_url
         if icon_src is None:
             cand = repo / ".claude-plugin/icon.png"
             if not cand.is_file():
@@ -958,6 +1063,7 @@ def generate_single(config):
                 f"agents only): {', '.join(unshipped)} - recorded in the "
                 "adapter README"
             )
+        check_no_escape_links(repo, upstream + [a["rel"] for a in agent_list])
         extra, skipped = copy_relocated(
             repo, upstream, moves, root, [a["rel"] for a in agent_list]
         )
@@ -968,15 +1074,36 @@ def generate_single(config):
         merged_names.extend(Path(e.rstrip("/")).name for e in entries)
         merged_keywords |= set(manifest.get("keywords", []))
         desc_bits.append(manifest.get("description") or repo.name)
-        licenses.add(manifest.get("license", "MIT"))
+        licenses.add(manifest.get("license") or "Unknown")
         nested = nested or any(group_of(e) for e in entries)
-        if multi:
+        # F4: a marketplace merge ships every upstream LICENSE; a published
+        # package ships the curated set ('license_files' names the repos)
+        want_lic = multi or (root_pkg and repo.name in (config.get("license_files") or []))
+        if want_lic:
             lic = find_license(repo)
             if lic:
                 shutil.copy2(lic, root / f"LICENSE-{repo.name}")
                 license_files.append(f"LICENSE-{repo.name}")
             else:
                 print(f"warning: {repo.name}: no LICENSE file found to ship in the merged plugin")
+        # F4/M3: root_package builds carry explicit repo-relative paths
+        # ("carry": ["tools/clis", "tools/integrations"]) so support files
+        # skills reference ship even when no markdown link reaches them.
+        # Byte-identical copy, no link rewriting (dest = upstream path).
+        if root_pkg:
+            for c in config.get("carry") or []:
+                src = repo / c
+                if not src.exists():
+                    sys.exit(f"{repo.name}: carry entry not found: {c}")
+                check_no_escape_links(repo, [c])
+                out = root / c
+                if out.exists():
+                    shutil.rmtree(out) if out.is_dir() else out.unlink()
+                out.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, out)
+                else:
+                    shutil.copy2(src, out)
 
     agent_defs = (
         ag.make_agent_defs(config, explicit_map, shipped_agents, nesting_map, merged_names)
@@ -1025,21 +1152,54 @@ def generate_single(config):
         "repository": repository,
         "license": "MIT" if licenses == {"MIT"} else ", ".join(sorted(licenses)),
         "keywords": keywords,
-        "skills": merged_entries,
     }
+    if not root_pkg:
+        plugin_manifest["skills"] = merged_entries
     if shipped_agents:
-        plugin_manifest["agents"] = ["./" + a["dest"].as_posix() for a in shipped_agents]
+        # marketplace manifests list "./agents/x.md"; the published-package
+        # shape (root_package) ships the bare repo-relative path. Both list
+        # the agents sorted, the shape the committed packages use.
+        pre = "" if root_pkg else "./"
+        plugin_manifest["agents"] = sorted(pre + a["dest"].as_posix() for a in shipped_agents)
     if icon_src is None and config.get("plugin_icon"):
-        icon_src = Path(config["plugin_icon"])
-    if icon_src is not None and icon_src.is_file():
-        shutil.copy2(icon_src, root / "icon.png")
-    if not (root / "icon.png").is_file():
-        write_placeholder_icon(root / "icon.png", config.get("plugin_title") or plugin_name)
-        print(
-            f"note: {plugin_name}: no upstream icon; wrote a placeholder - "
-            "set plugin_icon in build-config.json to replace it"
-        )
-    plugin_manifest["icon"] = "./icon.png"
+        p = Path(config["plugin_icon"])
+        icon_src = p if p.is_absolute() else adapter / p
+    if root_pkg:
+        # F4: published packages ship only assets/icon.png - no root icon.png
+        (root / "assets").mkdir(parents=True, exist_ok=True)
+        if icon_src is not None and icon_src.is_file():
+            shutil.copy2(icon_src, root / "assets" / "icon.png")
+        else:
+            write_placeholder_icon(root / "assets" / "icon.png", config.get("plugin_title") or plugin_name)
+            print(
+                f"note: {plugin_name}: no upstream icon; wrote a placeholder - "
+                "set plugin_icon in build-config.json to replace it"
+            )
+    else:
+        if icon_src is not None and icon_src.is_file():
+            shutil.copy2(icon_src, root / "icon.png")
+        if not (root / "icon.png").is_file():
+            write_placeholder_icon(root / "icon.png", config.get("plugin_title") or plugin_name)
+            print(
+                f"note: {plugin_name}: no upstream icon; wrote a placeholder - "
+                "set plugin_icon in build-config.json to replace it"
+            )
+        plugin_manifest["icon"] = "./icon.png"
+    if root_pkg:
+        # F4: the published-package manifest shape (displayName, homepage,
+        # assets/icon.png, no skills[] list — the app discovers skills/
+        # itself; a manifest skills list without skillPath loads 0 skills)
+        plugin_manifest["displayName"] = config.get("plugin_title") or prefix.title()
+        plugin_manifest["homepage"] = (owner or {}).get("url", "")
+        # keep key order of the committed packages: name, version,
+        # displayName, description, author, homepage, license, keywords, agents
+        ordered = {k: plugin_manifest[k] for k in (
+            "name", "version", "displayName", "description", "author",
+            "homepage", "license", "keywords",
+        ) if k in plugin_manifest}
+        if "agents" in plugin_manifest:
+            ordered["agents"] = plugin_manifest["agents"]
+        plugin_manifest = ordered
     (root / ".claude-plugin" / "plugin.json").write_text(
         json.dumps(plugin_manifest, indent=2) + "\n"
     )
@@ -1070,11 +1230,12 @@ def generate_single(config):
         native["homepage"] = owner["url"]
     if config.get("plugin_category"):
         native["categories"] = [config["plugin_category"]]
-    if (root / "icon.png").is_file():
+    if (root / "icon.png").is_file() and not root_pkg:
         (root / "assets").mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / "icon.png", root / "assets" / "icon.png")
         native["icon"] = "icon.png"
-    (root / "package.json").write_text(json.dumps(native, indent=2) + "\n")
+    if not root_pkg:
+        (root / "package.json").write_text(json.dumps(native, indent=2) + "\n")
     plugins = [{
         "name": plugin_name,
         "source": f"./plugins/{plugin_name}",
@@ -1094,15 +1255,49 @@ def generate_single(config):
         "description": mkt_desc,
         "plugins": plugins,
     }
-    (staging / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-    (staging / ".claude-plugin" / "marketplace.json").write_text(
-        json.dumps(marketplace, indent=2) + "\n"
-    )
-    if mkt_dir.exists():
-        mkt_dir.rename(retired)
-    staging.rename(mkt_dir)
-    if retired.exists():
-        shutil.rmtree(retired)
+    if not root_pkg:
+        (staging / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        (staging / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(marketplace, indent=2) + "\n"
+        )
+        if mkt_dir.exists():
+            mkt_dir.rename(retired)
+        staging.rename(mkt_dir)
+        if retired.exists():
+            shutil.rmtree(retired)
+    else:
+        # F4 curation parity: upstream skill docs invoke the carried CLIs
+        # with a repo-relative `node tools/clis/x.js`, which only works with
+        # the repo root as CWD. Installed, the agent runs from the user's
+        # project, so ship the plugin-root form the published packages use:
+        # node "${CLAUDE_PLUGIN_ROOT}/tools/clis/x.js". Carried tools/ docs
+        # stay byte-identical to upstream.
+        for md in sorted((root / "skills").rglob("*.md")):
+            text = md.read_text(errors="replace")
+            fixed = ROOT_CLI_RE.sub(
+                lambda m: f'node "${{CLAUDE_PLUGIN_ROOT}}/tools/clis/{m.group(1)}"', text
+            )
+            if fixed != text:
+                md.write_text(fixed)
+        # F4: swap generated top-level entries into the package repo in
+        # place. Only generated names are ever replaced (skills/, agents/,
+        # assets/, .claude-plugin/, tools/, icon.png, package.json, LICENSE-*);
+        # curated files (README.md, .gitignore, build-config.json,
+        # agent-prompts/) are never touched, so the published tree plus its
+        # hand-written README stays exactly as curated.
+        generated_names = {"skills", "agents", "assets", ".claude-plugin",
+                           "tools", "icon.png", "package.json"}
+        for name in sorted(p.name for p in package_dir.iterdir()):
+            if name in generated_names or name.startswith("LICENSE-"):
+                victim = package_dir / name
+                if victim.is_dir() and not victim.is_symlink():
+                    shutil.rmtree(victim)
+                else:
+                    victim.unlink()
+        for item in sorted(staging.iterdir()):
+            shutil.move(str(item), str(package_dir / item.name))
+        staging.rmdir()
+        mkt_dir = None
     map_path = adapter / "agent-map.json"
     if agents_on:
         map_path.write_text(json.dumps(
@@ -1130,11 +1325,12 @@ def generate_single(config):
     if skipped_all:
         line += f", foreign SKILL.md links left alone: {sorted(set(skipped_all))}"
     line += f" (v{version_stamp})"
-    if multi:
+    if license_files:
         line += f", LICENSE files copied: {sorted(license_files)}"
     return {
         "unshipped": unshipped_all,
         "mkt_dir": mkt_dir,
+        "package_dir": package_dir if root_pkg else None,
         "plugins": plugins,
         "report": [line],
         "versions": versions,
@@ -1145,6 +1341,11 @@ def generate_single(config):
 
 
 def write_support_files(config, result):
+    if config.get("root_package"):
+        # F4: a published package's README/.gitignore are hand-curated and
+        # must survive rebuilds byte-for-byte; agent-map.json (gitignored)
+        # is still written by generate_single
+        return
     adapter = Path(config["adapter_dir"])
     self_exe = Path(__file__).resolve()
     repos = repos_of(config)
@@ -1285,34 +1486,81 @@ def cmd_new(args):
         if not args.single:
             sys.exit("--agents needs --single")
         config["agents"] = {"enabled": True, "title_prefix": args.agents_title or prefix.capitalize()}
+    # F2: rerunning `new` over an existing adapter must never silently wipe
+    # curated build-config keys (agents map, groups, titles, categories,
+    # descriptions). Merge instead: keep the existing config and refresh only
+    # where the upstream clones are; --force regenerates from scratch.
+    cfg_path = adapter / "build-config.json"
+    if cfg_path.is_file():
+        if args.force:
+            print("note: --force given; build-config.json regenerated from scratch")
+        else:
+            existing = json.loads(cfg_path.read_text())
+            if not isinstance(existing, dict):
+                sys.exit(f"{cfg_path} is not a JSON object; rerun with --force to replace it")
+            kept = sorted(k for k in existing if k not in ("repos", "adapter_dir"))
+            existing["repos"] = config["repos"]
+            existing["adapter_dir"] = config["adapter_dir"]
+            config = existing
+            print(
+                "note: existing build-config.json kept its curated key(s): "
+                f"{', '.join(kept) if kept else '(none beyond repos)'}"
+                " - pass --force to regenerate from scratch"
+            )
     (adapter / "build-config.json").write_text(json.dumps(config, indent=2) + "\n")
-    result = generate(config)
+    result = generate_cleaning(config)
     write_support_files(config, result)
     print("\n".join(result["report"]))
     if len(result["versions"]) == 1:
         print(f"build version: {next(iter(result['versions'].values()))}")
     else:
         print("build versions: " + ", ".join(f"{k} {v}" for k, v in result["versions"].items()))
-    print(f"marketplace: {result['mkt_dir']}")
-    print("\nNext:")
-    print(f"  enconvo plugin validate '{result['mkt_dir']}'")
-    print(f"  enconvo plugin marketplace add '{result['mkt_dir']}'")
-    for p in result["plugins"]:
-        print(f"  enconvo plugin install {p['name']}@{config['marketplace_name']}")
+    if result.get("package_dir"):
+        print(f"package: {result['package_dir']}")
+        print("\nNext:")
+        print(f"  enconvo plugin validate '{result['package_dir']}'")
+        print(f"  git -C '{result['package_dir']}' diff   # review, then commit")
+    else:
+        print(f"marketplace: {result['mkt_dir']}")
+        print("\nNext:")
+        print(f"  enconvo plugin validate '{result['mkt_dir']}'")
+        print(f"  enconvo plugin marketplace add '{result['mkt_dir']}'")
+        for p in result["plugins"]:
+            print(f"  enconvo plugin install {p['name']}@{config['marketplace_name']}")
 
 
 def rebuild(config):
-    result = generate(config)
+    result = generate_cleaning(config)
     write_support_files(config, result)
     print("\n".join(result["report"]))
     print("build versions: " + ", ".join(f"{k} {v}" for k, v in result["versions"].items()))
-    print(f"marketplace: {result['mkt_dir']}")
+    if result.get("package_dir"):
+        print(f"package: {result['package_dir']}")
+    else:
+        print(f"marketplace: {result['mkt_dir']}")
     return result
+
+
+def generate_cleaning(config):
+    """generate() with F5 hygiene: a build that fails (hostile manifest,
+    missing folder, ...) must leave no .marketplace-new staging residue. On
+    success the staging dir has already been renamed into place, so the
+    cleanup is a no-op."""
+    staging = Path(config["adapter_dir"]).resolve() / ".marketplace-new"
+    if config.get("root_package"):
+        _pd = Path(config.get("package_dir") or config["adapter_dir"])
+        staging = (_pd if _pd.is_absolute() else Path(config["adapter_dir"]).resolve() / _pd).resolve() / ".package-new"
+    try:
+        return generate(config)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def cmd_build(args):
     config_path = Path(args.config).resolve()
     config = check_config(load_json(config_path, "build config"), config_path)
+    resolve_config_paths(config, config_path.parent)
     config["adapter_dir"] = str(config_path.parent)
     rebuild(config)
 
@@ -1333,6 +1581,7 @@ def enconvo_cli():
 def cmd_agents(args):
     config_path = Path(args.config).resolve()
     config = check_config(load_json(config_path, "build config"), config_path)
+    resolve_config_paths(config, config_path.parent)
     if not (config.get("agents") or {}).get("enabled"):
         sys.exit(f"{config_path} has no \"agents\": {{\"enabled\": true}}")
     ag.sync_agents(config_path.parent, config, prune=args.prune, dry_run=args.dry_run, update=args.update)
@@ -1341,15 +1590,46 @@ def cmd_agents(args):
 def cmd_sync(args):
     config_path = Path(args.config).resolve()
     config = check_config(load_json(config_path, "build config"), config_path)
+    resolve_config_paths(config, config_path.parent)
     config["adapter_dir"] = str(config_path.parent)
     for rcfg in repos_of(config):
         repo = Path(rcfg["path"]).resolve()
         print(f"pulling {repo.name}...")
-        out = run(["git", "-C", str(repo), "pull", "--ff-only"])
+        # F10: clones are depth-1 shallow; `git pull --ff-only` fails when
+        # the graft boundary moved. Fetch, then ff-only merge; if the shallow
+        # history blocks it, unshallow once and retry (clones stay pristine,
+        # so an unshallow is safe).
+        def _git(*args):
+            out = subprocess.run(["git", "-C", str(repo), *args],
+                                 capture_output=True, text=True)
+            return out.returncode, (out.stdout + out.stderr).strip()
+        rc, out = _git("fetch", "--quiet")
+        if rc != 0:
+            sys.exit(f"git fetch failed in {repo.name}: {out}")
+        rc, out = _git("merge", "--ff-only", "FETCH_HEAD")
+        if rc != 0:
+            rc2, unshallow = _git("fetch", "--unshallow", "--quiet")
+            if rc2 == 0:
+                rc, out = _git("merge", "--ff-only", "FETCH_HEAD")
+            if rc != 0:
+                sys.exit(
+                    f"cannot fast-forward {repo.name} (tried unshallow: "
+                    f"{rc2 == 0}): {out or unshallow}"
+                )
         for line in out.splitlines():
             if line.strip():
                 print(f"  {line.strip()}")
     result = rebuild(config)
+    if result.get("package_dir"):
+        # F4: published packages install from their git repo; the local
+        # rebuild only refreshes the tree. Publishing is a commit + push,
+        # and installed copies update via Plugins > Check for updates.
+        print(
+            "\nPackage rebuilt: " + str(result["package_dir"])
+            + "\nReview with git diff, commit and push; installed copies pick"
+            + "\nit up via Plugins > ... > Check for updates."
+        )
+        return
     agents_on = bool((config.get("agents") or {}).get("enabled"))
     if args.apply:
         cli = enconvo_cli()
@@ -1404,6 +1684,9 @@ def main():
                    help="override the generated marketplace.json description")
     n.add_argument("--owner-name")
     n.add_argument("--owner-url")
+    n.add_argument("--force", action="store_true",
+                   help="with an existing adapter, regenerate build-config.json "
+                        "from scratch instead of keeping its curated keys")
     n.set_defaults(func=cmd_new)
     b = sub.add_parser("build", help="rebuild from build-config.json")
     b.add_argument("--config", required=True)
