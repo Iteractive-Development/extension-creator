@@ -1009,6 +1009,11 @@ def generate_single(config):
     # or a LICENSE-* the current config no longer regenerates is never
     # silently destroyed.
     written_names = set()
+    # N1: names the build only partially writes (a carry's tools/<sub>
+    # subtree, assets/icon.png) map to the exact subpaths written; the swap
+    # deletes and re-replaces only those, never the whole top-level name,
+    # so hand-added siblings under the same name survive like curated files.
+    written_subpaths = {}
     nested = False
     seen_paths = set()
     unshipped_all = {}
@@ -1142,7 +1147,13 @@ def generate_single(config):
                 if not src.exists():
                     sys.exit(f"{repo.name}: carry entry not found: {c}")
                 check_no_escape_links(repo, [c])
-                written_names.add(Path(c).parts[0])
+                ctop = Path(c).parts[0]
+                csub = Path(*Path(c).parts[1:])
+                written_names.add(ctop)
+                if csub.parts:
+                    # N1: this carry writes only its subtree, so the swap
+                    # swaps tools/<sub>, not all of tools/.
+                    written_subpaths.setdefault(ctop, set()).add(csub.as_posix())
                 out = root / c
                 if out.exists():
                     shutil.rmtree(out) if out.is_dir() else out.unlink()
@@ -1214,7 +1225,10 @@ def generate_single(config):
     if root_pkg:
         # F4: published packages ship only assets/icon.png - no root icon.png
         (root / "assets").mkdir(parents=True, exist_ok=True)
+        # N1: only icon.png is generated under assets/, so the swap replaces
+        # assets/icon.png alone, not the whole assets/ tree.
         written_names.add("assets")
+        written_subpaths.setdefault("assets", set()).add("icon.png")
         if icon_src is not None and icon_src.is_file():
             shutil.copy2(icon_src, root / "assets" / "icon.png")
         else:
@@ -1256,6 +1270,10 @@ def generate_single(config):
         written_names.add("skills")
     if shipped_agents:
         written_names.add("agents")
+    # N1: these names are regenerated whole by this build, which supersedes
+    # any carry subpath under them — the swap must replace them fully.
+    for _full in (".claude-plugin", "skills", "agents"):
+        written_subpaths.pop(_full, None)
     skill_list = []
     for e in merged_entries:
         sf = root / e.rstrip("/") / "SKILL.md"
@@ -1340,6 +1358,12 @@ def generate_single(config):
         # hand-written README stays exactly as curated.
         generated_names = {"skills", "agents", "assets", ".claude-plugin",
                            "tools", "icon.png", "package.json"}
+        # N1: a name this build only partially writes (a carry's tools/<sub>
+        # subtrees, assets/icon.png) is swapped at the written-subtree level
+        # — delete tools/clis, not tools/ — so hand-added siblings under the
+        # same top-level name survive exactly like curated files. Fully
+        # written names keep the R5 behavior (replaced whole), and a name
+        # this build did not write at all is kept with the R5 warning.
         stale_kept = []
         for name in sorted(p.name for p in package_dir.iterdir()):
             if name in generated_names or name.startswith("LICENSE-"):
@@ -1350,18 +1374,59 @@ def generate_single(config):
                     # license_files); keep it and say so.
                     stale_kept.append(name)
                     continue
-                victim = package_dir / name
-                if victim.is_dir() and not victim.is_symlink():
-                    shutil.rmtree(victim)
+                subs = written_subpaths.get(name)
+                name_path = package_dir / name
+                if subs and name_path.is_dir() and not name_path.is_symlink():
+                    # N1: partial name — swap only the written subtrees.
+                    for sub in sorted(subs):
+                        victim = name_path / sub
+                        if victim.is_dir() and not victim.is_symlink():
+                            shutil.rmtree(victim)
+                        elif victim.exists() or victim.is_symlink():
+                            victim.unlink()
                 else:
-                    victim.unlink()
+                    # full swap — also covers a partial name held by a file
+                    # or symlink (never recurse into a linked name)
+                    victim = name_path
+                    if victim.is_dir() and not victim.is_symlink():
+                        shutil.rmtree(victim)
+                    else:
+                        victim.unlink()
+        # N1: anything still left under a partially swapped name was not
+        # written by this build (the written subtrees were just deleted) —
+        # keep it and say so, mirroring the R5 whole-name warning.
+        partial_kept = []
+        for name in sorted(written_subpaths):
+            base = package_dir / name
+            if not base.is_dir():
+                continue
+            for f in sorted(base.rglob("*")):
+                if f.is_file() or f.is_symlink():
+                    partial_kept.append(f.relative_to(package_dir).as_posix())
         if stale_kept:
             print(
                 f"warning: kept (not regenerated by this build; delete by "
                 f"hand if unwanted): {', '.join(sorted(stale_kept))}"
             )
+        if partial_kept:
+            print(
+                f"warning: kept (not written by this build; delete by hand "
+                f"if unwanted): {', '.join(sorted(set(partial_kept)))}"
+            )
+
+        def merge_move(src, dst):
+            # N1: a partially swapped name (tools/ keeping hand-added
+            # siblings) still exists in the package, so its staged tree
+            # merges in — a plain shutil.move would nest tools/tools/.
+            if src.is_dir() and dst.is_dir():
+                for child in sorted(src.iterdir()):
+                    merge_move(child, dst / child.name)
+                src.rmdir()
+            else:
+                shutil.move(str(src), str(dst))
+
         for item in sorted(staging.iterdir()):
-            shutil.move(str(item), str(package_dir / item.name))
+            merge_move(item, package_dir / item.name)
         staging.rmdir()
         mkt_dir = None
     map_path = adapter / "agent-map.json"

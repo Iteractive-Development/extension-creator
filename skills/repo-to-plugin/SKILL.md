@@ -207,7 +207,12 @@ belongs to which group) - both generated, never edit them.
   .gitignore, build-config.json, agent-prompts/) are never touched; the swap
   replaces only generated names the current build actually wrote, and KEEPS
   a generated name it did not write (a hand-added `tools/` extra, a
-  `LICENSE-<repo>` dropped from `license_files`) with a `kept:` warning.
+  `LICENSE-<repo>` dropped from `license_files`) with a `kept:` warning. A
+  name the build writes only in part — a carried `tools/<sub>` subtree, or
+  `assets/` where only `icon.png` is generated — is swapped at that subtree
+  level (`tools/clis`, not all of `tools/`), so hand-added siblings beside
+  the written subtree (e.g. `tools/extra.js` next to a carried `tools/clis`)
+  survive and are listed in the same `kept:` warning.
   `package_dir` must be the adapter folder itself or inside it.
 - `carry` (root_package mode): repo-relative paths copied byte-identical
   into the package even when no markdown link reaches them — support files

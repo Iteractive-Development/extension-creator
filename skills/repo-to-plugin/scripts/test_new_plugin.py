@@ -860,6 +860,48 @@ case("R5 dropped license_files keeps the old LICENSE-*",
      and "LICENSE-src" in r.stdout,
      (r.stdout + r.stderr).strip().splitlines()[-1][:90])
 
+# N1 (T-97 residual of R5): carry-subset swap granularity. The swap used to
+# delete at top-level-name granularity, so with carry: ["tools/clis"] a
+# hand-added tools/extra.js was silently wiped (whole tools/ swapped out),
+# and icon regeneration (a partial assets/ write) wiped assets/custom.png.
+# The swap now deletes at the written-subtree level (tools/clis, not tools/)
+# and keeps hand-added siblings with an explicit warning.
+r = run29(cfg29(carry=["tools/clis"]))
+case("N1 baseline carry build ok",
+     r.returncode == 0 and (pkg29 / "tools/clis/x.js").is_file(), r.stderr[-120:])
+(pkg29 / "tools/extra2.js").write_text("hand")
+(pkg29 / "assets").mkdir(exist_ok=True)
+(pkg29 / "assets/custom.png").write_text("hand")
+r = run29(cfg29(carry=["tools/clis"]))
+case("N1 hand-added tools sibling survives carry rebuild",
+     r.returncode == 0 and (pkg29 / "tools/extra2.js").read_text() == "hand"
+     and (pkg29 / "tools/clis/x.js").is_file()
+     and "tools/extra2.js" in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+case("N1 hand-added assets sibling survives icon regeneration",
+     r.returncode == 0 and (pkg29 / "assets/custom.png").read_text() == "hand"
+     and (pkg29 / "assets/icon.png").is_file()
+     and "assets/custom.png" in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+# N1 shrink case: a carry list that is a subset of the previous run's must
+# keep the dropped subtree with a warning (mirrors the R5 LICENSE-drop
+# contract), not silently swap it away with the whole tools/ name.
+(repo29 / "tools/integrations").mkdir(parents=True)
+(repo29 / "tools/integrations/i.md").write_text("integ\n")
+r = run29(cfg29(carry=["tools/clis", "tools/integrations"]))
+case("N1 both carried subtrees ship",
+     r.returncode == 0 and (pkg29 / "tools/integrations/i.md").is_file(), r.stderr[-120:])
+r = run29(cfg29(carry=["tools/clis"]))
+case("N1 dropped carry subtree kept with warning",
+     r.returncode == 0 and (pkg29 / "tools/integrations/i.md").is_file()
+     and "tools/integrations" in r.stdout,
+     (r.stdout + r.stderr).splitlines()[-1][:90])
+case("N1 dropped carry subtree not nested by re-move",
+     r.returncode == 0 and not (pkg29 / "tools/tools").exists()
+     and {"clis", "extra2.js", "integrations"}
+     <= {p.name for p in (pkg29 / "tools").iterdir()},
+     str(sorted(p.name for p in (pkg29 / "tools").iterdir())))
+
 shutil.rmtree(ws29)
 
 print()
