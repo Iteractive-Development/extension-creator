@@ -169,10 +169,24 @@ def collect_agents(repo, manifest):
             else:
                 sys.exit(f"{repo.name}: manifest lists agent file that does not exist: {e}")
     else:
-        rels = sorted(
-            p.relative_to(repo) for p in repo.glob("agents/**/*.md")
-            if p.name.lower() not in SKIP_AGENT_FILES
-        )
+        # R2: auto-discovery has no manifest containment check, so it must
+        # refuse symlinked agent files that resolve outside the repo (a
+        # hostile upstream ships `ln -s ~/.ssh/id_rsa agents/x.md` with no
+        # manifest change) and fail cleanly on a dangling link instead of a
+        # raw FileNotFoundError traceback.
+        repo_root = repo.resolve()
+        for p in sorted(repo.glob("agents/**/*.md")):
+            if p.name.lower() in SKIP_AGENT_FILES:
+                continue
+            resolved = p.resolve()
+            if resolved != repo_root and repo_root not in resolved.parents:
+                sys.exit(
+                    f"{repo.name}: agent file symlink leaves the repo and "
+                    f"would leak its target into the package: {p} -> {resolved}"
+                )
+            if not resolved.is_file():
+                sys.exit(f"{repo.name}: agent file is a dangling symlink: {p} -> {resolved}")
+            rels.append(p.relative_to(repo))
     out = []
     for rel in rels:
         text = (repo / rel).read_text(errors="replace")
