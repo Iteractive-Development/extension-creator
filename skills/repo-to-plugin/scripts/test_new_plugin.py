@@ -722,6 +722,146 @@ shutil.rmtree(ws28)
 
 srv.shutdown()
 
+# --- 29. round-2 guards: carry/agent/package_dir containment and swap ---
+# (R1-R3, R5, R6 from the T-95 round-2 review; root_package fixtures)
+import ast
+ws29 = Path(tempfile.mkdtemp(prefix="r2p-r2-"))
+out29 = ws29 / "outside"
+out29.mkdir()
+(out29 / "secret").write_text("SECRET-OUTSIDE")
+repo29 = ws29 / "src"
+(repo29 / "skills/main").mkdir(parents=True)
+(repo29 / "agents").mkdir()
+(repo29 / ".claude-plugin").mkdir()
+(repo29 / "LICENSE").write_text("MIT License\n")
+(repo29 / "skills/main/SKILL.md").write_text(
+    "---\nname: main\ndescription: Use for main work.\n---\nx\n")
+(repo29 / "agents/base.md").write_text(
+    "---\nname: base\ndescription: base agent\nskills: [main]\n---\nbody\n")
+(repo29 / ".claude-plugin/plugin.json").write_text(json.dumps({
+    "name": "src", "version": "1.0.0", "license": "MIT",
+    "skills": ["./skills/main"],
+}))
+adapter29 = ws29 / "pkg"
+adapter29.mkdir()
+pkg29 = ws29 / "pkg-root"
+pkg29.mkdir()
+
+
+def cfg29(**over):
+    cfg = {
+        "adapter_dir": str(adapter29), "prefix": "t", "plugin_name": "tpkg",
+        "marketplace_name": "tpkg",
+        "repos": [{"path": str(repo29), "url": ""}],
+        "owner": {"name": "O"}, "flatten": True,
+        "groups": {"g": {"skills": ["main"], "catch_all": True}},
+        "agents": {"enabled": True, "title_prefix": "T"},
+        "root_package": True, "package_dir": str(pkg29),
+        "plugin_version": "1.0.0",
+    }
+    cfg.update(over)
+    p = ws29 / "cfg29.json"
+    p.write_text(json.dumps(cfg))
+    return p
+
+
+def run29(cfg):
+    return build(cfg)
+
+r = run29(cfg29())
+case("root_package fixture builds", r.returncode == 0, r.stderr[-120:])
+
+# R1a: carry entry escaping the repo
+r = run29(cfg29(carry=["../outside"]))
+case("R1 carry dir escape rejected",
+     r.returncode == 1 and "carry entry leaves the repo" in r.stdout + r.stderr
+     and "Traceback" not in r.stderr,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+case("R1 carry dir escape ships nothing", not (pkg29 / "outside").exists())
+
+# R1b/R3: carry file symlink out of the repo
+import os
+os.symlink(out29 / "secret", repo29 / "leaky.js")
+r = run29(cfg29(carry=["leaky.js"]))
+case("R1/R3 carry file symlink escape rejected",
+     r.returncode == 1 and "leaves the repo" in r.stdout + r.stderr,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+case("R1/R3 carry file symlink ships nothing",
+     not (pkg29 / "leaky.js").exists())
+
+# R1c: a legitimate carry still ships
+(repo29 / "tools/clis").mkdir(parents=True)
+(repo29 / "tools/clis/x.js").write_text("console.log(1)\n")
+r = run29(cfg29(carry=["tools/clis"]))
+case("R1 legit carry still ships",
+     r.returncode == 0 and (pkg29 / "tools/clis/x.js").is_file(), r.stderr[-120:])
+
+# R3: symlink inside a carried directory
+os.symlink(out29 / "secret", repo29 / "tools/clis/leak.js")
+r = run29(cfg29(carry=["tools/clis"]))
+case("R3 symlink inside carried dir rejected",
+     r.returncode == 1 and "leaves the repo" in r.stdout + r.stderr
+     and not (pkg29 / "tools/clis/leak.js").exists(),
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+(repo29 / "tools/clis/leak.js").unlink()
+
+# R2a: auto-discovered agent symlink out of the repo (marketplace mode check
+# lives in agents_support; here root_package, the shipped mode)
+os.symlink(out29 / "secret", repo29 / "agents/leaked.md")
+r = run29(cfg29())
+case("R2 agent symlink escape rejected",
+     r.returncode == 1 and "agent file symlink leaves the repo" in r.stdout + r.stderr,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+case("R2 agent symlink ships nothing", not (pkg29 / "agents/leaked.md").exists())
+
+# R2b: dangling agent symlink is a clean error (target inside the repo so
+# the escape check passes and the existence check fires)
+(repo29 / "agents/leaked.md").unlink()
+os.symlink(repo29 / "skills/ghost.md", repo29 / "agents/leaked.md")
+r = run29(cfg29())
+case("R2 dangling agent symlink clean error",
+     r.returncode == 1 and "dangling" in r.stdout + r.stderr
+     and "Traceback" not in r.stderr,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+(repo29 / "agents/leaked.md").unlink()
+
+# R6: package_dir outside the adapter folder is refused (the check lives on
+# the config-in-adapter layout, the real one 'new' scaffolds and the
+# packages ship)
+outside_dir = ws29 / "victim"
+outside_dir.mkdir()
+adapter29.joinpath("cfg-in-adapter.json").write_text(
+    json.dumps({**json.loads((ws29 / "cfg29.json").read_text()),
+                "package_dir": str(outside_dir)}))
+r = sh("python3", BUILDER, "build", "--config", str(adapter29 / "cfg-in-adapter.json"))
+case("R6 package_dir outside adapter refused",
+     r.returncode == 1 and "package_dir must be" in r.stdout + r.stderr
+     and not (outside_dir / "skills").exists(),
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+
+# R5: rerun the good build, then hand-add an untracked tools/ extra and drop
+# license_files — neither may be wiped by the swap
+r = run29(cfg29())
+case("R5 baseline rebuild ok", r.returncode == 0, r.stderr[-120:])
+(pkg29 / "tools").mkdir(exist_ok=True)
+(pkg29 / "tools/extra.js").write_text("extra")
+# no carry in this config now, so the build writes no tools/
+r = run29(cfg29())
+case("R5 untracked tools/ extra survives rebuild",
+     r.returncode == 0 and (pkg29 / "tools/extra.js").read_text() == "extra"
+     and "kept" in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+r = run29(cfg29(license_files=["src"]))
+case("R5 license_files regenerates LICENSE-<repo>",
+     r.returncode == 0 and (pkg29 / "LICENSE-src").is_file(), r.stderr[-120:])
+r = run29(cfg29())
+case("R5 dropped license_files keeps the old LICENSE-*",
+     r.returncode == 0 and (pkg29 / "LICENSE-src").is_file()
+     and "LICENSE-src" in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+
+shutil.rmtree(ws29)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILED: {FAILS}")

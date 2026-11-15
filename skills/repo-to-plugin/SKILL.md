@@ -197,6 +197,32 @@ belongs to which group) - both generated, never edit them.
 - Skill names stay upstream's. Two plugins shipping the same skill name get
   `<plugin>:<name>` prefixes in chat - one plugin per adapter makes that
   impossible within a series.
+- `root_package` (published-package mode, the bama/cyber/marketing-enconvo
+  repos use it): with `"plugin_name"` set, the build stages the plugin tree
+  (skills/, agents/, assets/, .claude-plugin/plugin.json, carried tools/,
+  LICENSE-*) and swaps it into `package_dir` in place on success — the
+  package repo's root by default. No marketplace/, no native package.json,
+  no `skills[]` manifest list (the app discovers skills/ itself), version
+  from `plugin_version`, author = the series owner. Curated files (README.md,
+  .gitignore, build-config.json, agent-prompts/) are never touched; the swap
+  replaces only generated names the current build actually wrote, and KEEPS
+  a generated name it did not write (a hand-added `tools/` extra, a
+  `LICENSE-<repo>` dropped from `license_files`) with a `kept:` warning.
+  `package_dir` must be the adapter folder itself or inside it.
+- `carry` (root_package mode): repo-relative paths copied byte-identical
+  into the package even when no markdown link reaches them — support files
+  skills invoke, e.g. `["tools/clis", "tools/integrations"]`. Entries must
+  stay inside the repo (absolute paths and `../` escapes fail the build) and
+  symlinked entries are scanned like every other copy path: a link whose
+  target resolves outside the repo, or a dangling link, is a hard error.
+- `license_files` (root_package mode): which repo names ship a
+  `LICENSE-<repo>` copy. Multi-repo (marketplace) merges always ship every
+  upstream LICENSE; a root_package build ships only the named ones.
+- Security posture (same trust class for every copy path — manifest skills[],
+  manifest/auto-discovered agents, carry): no build input may move content
+  from outside a repo into the package. Path containment and the symlink
+  scan (`check_no_escape_links`, file entries included) run before any copy;
+  violations are clean `rc=1` errors naming the entry.
 - Odd shapes (e.g. `plugins/<cat>/...`) need a small builder extension first -
   extend `new_plugin.py` rather than hand-copying files, so updates stay one
   command.
