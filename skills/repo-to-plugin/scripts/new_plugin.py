@@ -1394,14 +1394,22 @@ def generate_single(config):
                         victim.unlink()
         # N1: anything still left under a partially swapped name was not
         # written by this build (the written subtrees were just deleted) —
-        # keep it and say so, mirroring the R5 whole-name warning.
+        # keep it and say so, mirroring the R5 whole-name warning. Files
+        # under a carried subpath itself are this build's own output (a
+        # carry under a non-generated name like scripts/ is not swapped at
+        # all, so its freshly carried files are still there) and must not
+        # be reported.
         partial_kept = []
         for name in sorted(written_subpaths):
+            subs = written_subpaths[name]
             base = package_dir / name
             if not base.is_dir():
                 continue
             for f in sorted(base.rglob("*")):
                 if f.is_file() or f.is_symlink():
+                    rel = f.relative_to(base).as_posix()
+                    if rel in subs or rel.split("/", 1)[0] in subs:
+                        continue
                     partial_kept.append(f.relative_to(package_dir).as_posix())
         if stale_kept:
             print(

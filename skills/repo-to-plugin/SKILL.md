@@ -220,6 +220,11 @@ belongs to which group) - both generated, never edit them.
   stay inside the repo (absolute paths and `../` escapes fail the build) and
   symlinked entries are scanned like every other copy path: a link whose
   target resolves outside the repo, or a dangling link, is a hard error.
+  Carried files are never reported as kept-unwritten on a rerun. Dropping a
+  carry entry does not delete its files: under a generated name (`tools/`)
+  the leftovers surface in the `kept:` warning, but under any other name
+  (`scripts/`, `docs/`) the build keeps no cross-run state, so delete those
+  by hand.
 - `license_files` (root_package mode): which repo names ship a
   `LICENSE-<repo>` copy. Multi-repo (marketplace) merges always ship every
   upstream LICENSE; a root_package build ships only the named ones.

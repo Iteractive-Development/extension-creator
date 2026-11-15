@@ -902,6 +902,31 @@ case("N1 dropped carry subtree not nested by re-move",
      <= {p.name for p in (pkg29 / "tools").iterdir()},
      str(sorted(p.name for p in (pkg29 / "tools").iterdir())))
 
+# T-107 follow-up (cosmetic): a carry under a top-level name the builder
+# does not generate (scripts/, docs/) must not flag its own freshly carried
+# files as kept-unwritten on a rerun — the carry's files are this build's
+# output, not hand additions.
+(repo29 / "scripts").mkdir(parents=True)
+(repo29 / "scripts/run.js").write_text("console.log(0)\n")
+r = run29(cfg29(carry=["tools/clis", "scripts/run.js"]))
+case("carry under non-generated name ships",
+     r.returncode == 0 and (pkg29 / "scripts/run.js").is_file(), r.stderr[-120:])
+r = run29(cfg29(carry=["tools/clis", "scripts/run.js"]))
+case("rerun carries nothing kept-unwritten",
+     r.returncode == 0 and "scripts/run.js" not in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+case("rerun of same carry warns only about real hand additions",
+     r.returncode == 0 and "tools/extra2.js" in r.stdout
+     and "scripts/run.js" not in r.stdout,
+     (r.stdout + r.stdout).strip().splitlines()[-1][:90])
+# documented boundary: dropping a carry under a non-generated name keeps
+# its files silently (no cross-run state; SKILL.md says delete by hand)
+r = run29(cfg29(carry=["tools/clis"]))
+case("dropped non-generated-name carry stays silent, files kept",
+     r.returncode == 0 and (pkg29 / "scripts/run.js").is_file()
+     and "scripts/run.js" not in r.stdout,
+     (r.stdout + r.stderr).strip().splitlines()[-1][:90])
+
 shutil.rmtree(ws29)
 
 print()
