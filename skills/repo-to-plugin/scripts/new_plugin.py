@@ -443,6 +443,18 @@ def check_no_escape_links(repo, dirs):
     repo_root = repo.resolve()
     for d in dirs:
         d = (repo / str(d).rstrip("/")) if not Path(d).is_absolute() else Path(d)
+        # R3: a non-directory entry (a carried file, an agent .md) is scanned
+        # for its own symlink too — file entries are copy paths just like
+        # directories, and copy2 follows links.
+        if d.is_symlink():
+            target = d.resolve()
+            if target != repo_root and repo_root not in target.parents:
+                sys.exit(
+                    f"symlink leaves the repo and would leak its target "
+                    f"into the package: {d} -> {target}"
+                )
+            if not d.exists():
+                sys.exit(f"dangling symlink in a build entry: {d} -> {target}")
         if not d.is_dir():
             continue
         for p in d.rglob("*"):
@@ -453,6 +465,22 @@ def check_no_escape_links(repo, dirs):
                         f"symlink leaves the repo and would leak its target "
                         f"into the package: {p} -> {target}"
                     )
+                if not p.exists():
+                    sys.exit(f"dangling symlink in a build entry: {p} -> {target}")
+
+
+def validate_entry_path(repo, entry, label):
+    """R1: a build-config entry naming a repo-relative path (carry, package
+    dir contents) may not escape the repo: reject absolute paths and any
+    resolved target outside the repo root, so `"carry": ["../vault2"]` or a
+    carried file symlink cannot ship outside-repo content."""
+    if Path(entry).is_absolute():
+        sys.exit(f"{label} entry must be repo-relative, not absolute: {entry}")
+    target = (repo / entry).resolve()
+    root = repo.resolve()
+    if target != root and root not in target.parents:
+        sys.exit(f"{label} entry leaves the repo: {entry}")
+    return target
 
 
 def copy_entries(repo, entries, root):
@@ -937,8 +965,17 @@ def generate_single(config):
     # old generator shape that had to be hand-flattened.
     package_dir = adapter
     if root_pkg and config.get("package_dir"):
+        # R6: package_dir may not point at an arbitrary directory — the swap
+        # deletes generated names there on a rerun, so a wrong value can
+        # bulk-delete skills/agents/tools in an unrelated folder. Contain it
+        # to the adapter folder (equal to it or inside it).
         p = Path(config["package_dir"])
         package_dir = (p if p.is_absolute() else adapter / p).resolve()
+        if package_dir != adapter and adapter not in package_dir.parents:
+            sys.exit(
+                f"package_dir must be the adapter folder itself or inside it, "
+                f"not: {package_dir}"
+            )
     staging = package_dir / ".package-new" if root_pkg else adapter / ".marketplace-new"
     mkt_dir = adapter / "marketplace"
     retired = adapter / ".marketplace-old"
@@ -967,6 +1004,11 @@ def generate_single(config):
     extra_total, skipped_all = 0, []
     author, repository, version_stamp, icon_src = None, "", "1.0.0", None
     license_files = []
+    # R5: top-level names this build actually wrote into staging; the swap
+    # deletes only generated names present here, so a hand-added tools/ extra
+    # or a LICENSE-* the current config no longer regenerates is never
+    # silently destroyed.
+    written_names = set()
     nested = False
     seen_paths = set()
     unshipped_all = {}
@@ -1084,6 +1126,7 @@ def generate_single(config):
             if lic:
                 shutil.copy2(lic, root / f"LICENSE-{repo.name}")
                 license_files.append(f"LICENSE-{repo.name}")
+                written_names.add(f"LICENSE-{repo.name}")
             else:
                 print(f"warning: {repo.name}: no LICENSE file found to ship in the merged plugin")
         # F4/M3: root_package builds carry explicit repo-relative paths
@@ -1092,10 +1135,14 @@ def generate_single(config):
         # Byte-identical copy, no link rewriting (dest = upstream path).
         if root_pkg:
             for c in config.get("carry") or []:
+                # R1: validate the entry itself (path containment + symlink
+                # scan via check_no_escape_links) before any copy.
+                validate_entry_path(repo, c, f"{repo.name}: carry")
                 src = repo / c
                 if not src.exists():
                     sys.exit(f"{repo.name}: carry entry not found: {c}")
                 check_no_escape_links(repo, [c])
+                written_names.add(Path(c).parts[0])
                 out = root / c
                 if out.exists():
                     shutil.rmtree(out) if out.is_dir() else out.unlink()
@@ -1167,6 +1214,7 @@ def generate_single(config):
     if root_pkg:
         # F4: published packages ship only assets/icon.png - no root icon.png
         (root / "assets").mkdir(parents=True, exist_ok=True)
+        written_names.add("assets")
         if icon_src is not None and icon_src.is_file():
             shutil.copy2(icon_src, root / "assets" / "icon.png")
         else:
@@ -1203,6 +1251,11 @@ def generate_single(config):
     (root / ".claude-plugin" / "plugin.json").write_text(
         json.dumps(plugin_manifest, indent=2) + "\n"
     )
+    written_names.add(".claude-plugin")
+    if merged_entries:
+        written_names.add("skills")
+    if shipped_agents:
+        written_names.add("agents")
     skill_list = []
     for e in merged_entries:
         sf = root / e.rstrip("/") / "SKILL.md"
@@ -1287,13 +1340,26 @@ def generate_single(config):
         # hand-written README stays exactly as curated.
         generated_names = {"skills", "agents", "assets", ".claude-plugin",
                            "tools", "icon.png", "package.json"}
+        stale_kept = []
         for name in sorted(p.name for p in package_dir.iterdir()):
             if name in generated_names or name.startswith("LICENSE-"):
+                if name not in written_names:
+                    # R5: this build did not regenerate it — never delete a
+                    # generated name the current build doesn't write (a
+                    # hand-added tools/ extra, a LICENSE-* dropped from
+                    # license_files); keep it and say so.
+                    stale_kept.append(name)
+                    continue
                 victim = package_dir / name
                 if victim.is_dir() and not victim.is_symlink():
                     shutil.rmtree(victim)
                 else:
                     victim.unlink()
+        if stale_kept:
+            print(
+                f"warning: kept (not regenerated by this build; delete by "
+                f"hand if unwanted): {', '.join(sorted(stale_kept))}"
+            )
         for item in sorted(staging.iterdir()):
             shutil.move(str(item), str(package_dir / item.name))
         staging.rmdir()
@@ -1549,7 +1615,17 @@ def generate_cleaning(config):
     staging = Path(config["adapter_dir"]).resolve() / ".marketplace-new"
     if config.get("root_package"):
         _pd = Path(config.get("package_dir") or config["adapter_dir"])
-        staging = (_pd if _pd.is_absolute() else Path(config["adapter_dir"]).resolve() / _pd).resolve() / ".package-new"
+        _pd = (_pd if _pd.is_absolute() else Path(config["adapter_dir"]).resolve() / _pd).resolve()
+        # R6: same containment as generate() — a stray package_dir must not
+        # have staging (or, via the swap, generated names) written outside
+        # the adapter folder.
+        _ad = Path(config["adapter_dir"]).resolve()
+        if _pd != _ad and _ad not in _pd.parents:
+            sys.exit(
+                f"package_dir must be the adapter folder itself or inside it, "
+                f"not: {_pd}"
+            )
+        staging = _pd / ".package-new"
     try:
         return generate(config)
     finally:
